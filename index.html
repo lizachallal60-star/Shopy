@@ -456,7 +456,7 @@ const mark = (s = 34) => { let p = ''; for (let i = 0; i < 5; i++) p += `<ellips
 const EXPENSE_CATS = ['Achat de marchandises', 'Loyer', 'Publicité', 'Électricité', 'Transport', 'Salaires', 'Travaux', 'Autres dépenses'];
 const COGS_CAT = 'Achat de marchandises';
 const DEFAULT_SETTINGS = {
-  key: 'main', shopName: 'Shopy', logo: '', currency: 'DZD', defaultAlert: 5, weekStart: 0,
+  key: 'main', shopName: 'Shopy', adminName: '', logo: '', currency: 'DZD', defaultAlert: 5, weekStart: 0,
   categories: ['Maquillage', 'Soin visage', 'Soin corps', 'Cheveux', 'Parfums', 'Ongles', 'Accessoires'],
   brands: [], suppliers: [], lastBackup: null, barcodeSeq: 0,
   label: { fmt: 'a4-24', w: 50, h: 30, showName: true, showPrice: true },
@@ -532,7 +532,9 @@ const FIREBASE_CONFIG = {
   appId: "1:724032398207:web:5bc464fa6099994b2b704a"
 };
 const CLOUD_STORES = ['products', 'sales', 'expenses', 'moves', 'clients', 'materials', 'containers', 'pmoves', 'perfumes', 'employees', 'shifts'];
-const cloud = { app: null, auth: null, db: null, ready: false, user: null, unsub: [], bootDone: {}, err: '' };
+const cloud = { app: null, auth: null, db: null, ready: false, user: null, unsub: [], bootDone: {}, err: '', errs: 0, lastErr: '' };
+/* Les erreurs de synchronisation ne sont plus silencieuses : elles sont comptées et affichées */
+function cloudNoteErr(where, e) { cloud.errs++; cloud.lastErr = where + ' : ' + ((e && (e.code || e.message)) || 'erreur'); try { console.error('cloud', cloud.lastErr); refresh(); } catch (x) {} }
 function cloudInit() {
   try {
     if (typeof firebase === 'undefined') return false;
@@ -558,6 +560,11 @@ async function cloudSignIn(email, pass) {
   try { await cloud.auth.signInWithEmailAndPassword(email, pass); return { ok: true }; }
   catch (e) { return { ok: false, err: cloudErrMsg(e) }; }
 }
+async function cloudResetPassword(email) {
+  if (!cloud.ready) return { ok: false, err: 'Service de synchronisation indisponible sur cet appareil' };
+  try { await cloud.auth.sendPasswordResetEmail(email); return { ok: true }; }
+  catch (e) { return { ok: false, err: cloudErrMsg(e) }; }
+}
 function cloudSignOut() { if (cloud.ready && cloud.auth) cloud.auth.signOut(); }
 function onCloudAuthChange(user) {
   cloud.unsub.forEach(u => { try { u(); } catch (e) {} });
@@ -569,7 +576,9 @@ function cloudStartSync() {
   CLOUD_STORES.forEach(store => {
     cloud.bootDone[store] = false;
     const unsub = cloud.db.collection(store).onSnapshot(snap => {
+      const firstSnap = !cloud.bootDone[store], inCloud = new Set();
       snap.docChanges().forEach(ch => {
+        if (ch.type !== 'removed') inCloud.add(ch.doc.id);
         const arr = state[store];
         if (ch.type === 'removed') { state[store] = arr.filter(x => x.id !== ch.doc.id); DB.batch([{ store, del: ch.doc.id }]).catch(() => {}); }
         else {
@@ -580,13 +589,15 @@ function cloudStartSync() {
         }
       });
       cloud.bootDone[store] = true;
+      /* À la 1re synchronisation, envoie au cloud ce qui n'existe que sur cet appareil (ex. produits ajoutés avant la connexion) : ajout seulement, rien n'est supprimé */
+      if (firstSnap) (state[store] || []).forEach(x => { if (x && x.id && !inCloud.has(x.id)) { try { cloud.db.collection(store).doc(x.id).set(x).catch(e => cloudNoteErr('envoi ' + store, e)); } catch (e) {} } });
       try { refresh(); } catch (e) {}
-    }, err => console.error('sync', store, err));
+    }, err => cloudNoteErr('lecture ' + store, err));
     cloud.unsub.push(unsub);
   });
   const sUnsub = cloud.db.collection('settings').doc('main').onSnapshot(doc => {
     if (doc.exists) { state.settings = { ...clone(DEFAULT_SETTINGS), ...doc.data() }; DB.batch([{ store: 'settings', put: state.settings }]).catch(() => {}); try { refresh(); } catch (e) {} }
-  }, err => console.error('sync settings', err));
+  }, err => cloudNoteErr('lecture réglages', err));
   cloud.unsub.push(sUnsub);
 }
 /* Chaque écriture locale (persist) est aussi envoyée au cloud si une session de synchronisation est active */
@@ -594,10 +605,10 @@ function cloudPush(ops) {
   if (!cloud.ready || !cloud.user || !cloud.db) return;
   ops.forEach(o => {
     try {
-      if (o.store === 'settings') { if (o.put) cloud.db.collection('settings').doc('main').set(o.put).catch(() => {}); }
+      if (o.store === 'settings') { if (o.put) cloud.db.collection('settings').doc('main').set(o.put).catch(e => cloudNoteErr('envoi réglages', e)); }
       else if (CLOUD_STORES.includes(o.store)) {
-        if (o.put) cloud.db.collection(o.store).doc(o.put.id).set(o.put).catch(() => {});
-        else if (o.del !== undefined) cloud.db.collection(o.store).doc(o.del).delete().catch(() => {});
+        if (o.put) cloud.db.collection(o.store).doc(o.put.id).set(o.put).catch(e => cloudNoteErr('envoi ' + o.store, e));
+        else if (o.del !== undefined) cloud.db.collection(o.store).doc(o.del).delete().catch(e => cloudNoteErr('suppression ' + o.store, e));
         /* o.clear (ex. restauration d'une sauvegarde) n'efface pas le cloud automatiquement : chaque élément restauré est réécrit individuellement ci-dessus */
       }
     } catch (e) { console.error('cloudPush', e); }
@@ -652,12 +663,16 @@ const hasPerm = (emp, key) => !emp ? false : (emp.perms && key in emp.perms ? !!
 const can = key => ui.session.role === 'admin' ? true : hasPerm(currentEmp(), key);
 const canAccessRoute = route => ui.session.role === 'admin' ? true : (ROUTE_PERM[route] ? can(ROUTE_PERM[route]) : true);
 const needsLogin = () => !!state.settings.adminPin && !ui.session.role;
+/* Interface administratrice : adresse .../#/admin, protégée par mot de passe, séparée de l'accès des employées */
+const isAdminRoute = () => { try { return /^#\/admin\/?$/.test(location.hash); } catch (e) { return false; } };
+const adminGate = () => isAdminRoute() && ui.session.role !== 'admin';
+const gateActive = () => needsLogin() || adminGate();
 function loadSession() {
   try { const raw = localStorage.getItem('shopy-session'); if (raw) { const s = JSON.parse(raw); if (s && (s.role === 'admin' || s.role === 'employee')) return { role: s.role, employeeId: s.employeeId || null }; } } catch (e) {}
   return { role: null, employeeId: null };
 }
 function saveSession() { try { localStorage.setItem('shopy-session', JSON.stringify(ui.session)); } catch (e) {} }
-function whoLabel() { return ui.session.role === 'admin' ? 'Administratrice' : (currentEmp()?.name || 'Employée'); }
+function whoLabel() { return ui.session.role === 'admin' ? (state.settings.adminName || 'Administratrice') : (currentEmp()?.name || 'Employée'); }
 function pickEmployeeSession(id) {
   const e = state.employees.find(x => x.id === id); if (!e) return;
   ui.session = { role: 'employee', employeeId: e.id }; saveSession(); closeModal(); refresh();
@@ -669,27 +684,27 @@ function requestAdminSession() {
 function whoSwitchModal() {
   openModal('Changer de compte', `<p class="muted" style="margin-bottom:12px">Connecté(e) actuellement : <b>${esc(whoLabel())}</b></p>
     <div class="emppick">${state.employees.map(e => `<button class="btn ghost big" data-act="pickWho" data-id="${e.id}">${esc(e.name)}</button>`).join('')}
-    <button class="btn ghost big" data-act="pickAdmin">Administratrice</button></div>`);
+    ${ui.session.role === 'admin' ? '<button class="btn ghost big" data-act="pickAdmin">Administratrice</button>' : ''}</div>`);
 }
 function loginGateHTML() {
-  const mode = state.employees.length ? (ui.gateView || 'pass') : 'pass';
   const brand = `<div class="brand" style="justify-content:center;margin-bottom:22px">${state.settings.logo ? `<img src="${state.settings.logo}" alt="">` : mark(46)}<span class="wordmark" style="font-size:30px">${esc(state.settings.shopName || 'Shopy')}</span></div>`;
-  if (mode === 'employees') {
-    return `<div class="gate-wrap"><div class="gate-stripes" aria-hidden="true"></div><div class="gate-card">
-      ${brand}
-      <h1 style="font:500 22px var(--serif);margin-bottom:4px">Qui êtes-vous ?</h1><p class="muted" style="margin-bottom:18px">Touchez votre nom pour commencer.</p>
-      <div class="emppick">${state.employees.map(e => `<button class="btn ghost big" data-act="pickWho" data-id="${e.id}">${esc(e.name)}</button>`).join('')}</div>
-      <button class="btn ghost block" style="margin-top:18px" data-act="gateShowPass">${ic('lock')} Mot de passe administratrice</button>
-    </div></div>`;
+  const wrap = inner => `<div class="gate-wrap"><div class="gate-stripes" aria-hidden="true"></div><div class="gate-card">${brand}${inner}</div></div>`;
+  const pwField = (name, id, label, ph, auto) => `<label class="f full"><span>${label}</span><div class="pwrow"><input name="${name}" ${id ? `id="${id}"` : ''} type="password" autocomplete="${auto}" required placeholder="${ph}"><button type="button" class="icon-btn" data-act="gateToggleEye" aria-label="Afficher le mot de passe">${ic('eye')}</button></div></label>`;
+  /* Adresse /#/admin : espace administratrice, accessible uniquement avec le mot de passe */
+  if (isAdminRoute()) {
+    if (!state.settings.adminPin) {
+      return wrap(`<h1 style="font:500 22px var(--serif);margin-bottom:4px">Espace administratrice</h1><p class="muted" style="margin-bottom:16px">Créez votre mot de passe (6 caractères minimum, avec lettres, majuscules et chiffres si vous voulez). Il sera demandé à chaque fois sur cette page.</p>
+        <form data-form="adminsetup" autocomplete="off" style="text-align:left">${pwField('pw', 'gatepw', 'Nouveau mot de passe', 'Votre mot de passe', 'new-password')}${pwField('pw2', '', 'Confirmer', 'Retapez-le', 'new-password')}
+        <button class="btn block" type="submit" style="margin-top:14px">Créer mon mot de passe</button></form>`);
+    }
+    return wrap(`<h1 style="font:500 22px var(--serif);margin-bottom:14px">Espace administratrice</h1>
+      <form data-form="gatepass" autocomplete="off" style="text-align:left">${pwField('pw', 'gatepw', 'Mot de passe', 'Votre mot de passe', 'current-password')}
+      <button class="btn block" type="submit" style="margin-top:14px">Entrer</button></form>`);
   }
-  return `<div class="gate-wrap"><div class="gate-stripes" aria-hidden="true"></div><div class="gate-card">
-    ${brand}
-    <form data-form="gatepass" autocomplete="off" style="text-align:left">
-      <label class="f full"><span>Mot de passe</span><div class="pwrow"><input name="pw" id="gatepw" type="password" autocomplete="current-password" required autofocus placeholder="Votre mot de passe"><button type="button" class="icon-btn" data-act="gateToggleEye" aria-label="Afficher le mot de passe">${ic('eye')}</button></div></label>
-      <button class="btn block" type="submit" style="margin-top:14px">Entrer</button>
-    </form>
-    ${state.employees.length ? `<button class="btn ghost block" style="margin-top:14px" data-act="gateShowEmp">Je suis une employée</button>` : ''}
-  </div></div>`;
+  /* Entrée habituelle : choix de l'employée (aucun accès administratrice visible ici) */
+  if (!state.employees.length) return wrap(`<p class="muted">Aucune employée n'est enregistrée sur cet appareil. Demandez à l'administratrice.</p>`);
+  return wrap(`<h1 style="font:500 22px var(--serif);margin-bottom:4px">Qui êtes-vous ?</h1><p class="muted" style="margin-bottom:18px">Touchez votre nom pour commencer.</p>
+    <div class="emppick">${state.employees.map(e => `<button class="btn ghost big" data-act="pickWho" data-id="${e.id}">${esc(e.name)}</button>`).join('')}</div>`);
 }
 /* Autorisations : fiche employée ouverte dans Paramètres, réservée à l'administratrice */
 function permsSectionHTML() {
@@ -705,6 +720,21 @@ function permsSectionHTML() {
     <button class="btn" style="margin-top:16px" data-act="savePerms">Enregistrer les autorisations</button></div>`;
 }
 /* Synchronisation tablette <-> téléphone (Firebase, facultatif) : réservée à l'administratrice */
+function storageDiagHTML() {
+  return `<div class="card set-sec"><h2>État du stockage</h2><p class="hint">Vérifie où sont vraiment enregistrées vos données.</p><div id="stdiag" class="hint">Vérification…</div><button class="btn ghost sm" data-act="checkStorage" style="margin-top:10px">Revérifier</button></div>`;
+}
+async function checkStorage() {
+  const box = $('#stdiag'); if (!box) return;
+  const L = [];
+  L.push(`Produits sur cet appareil : <b>${state.products.length}</b>`);
+  L.push(state.persistent ? 'Mémoire du navigateur : <b>disponible</b>' : '<b style="color:#C0392B">Mémoire du navigateur indisponible</b>');
+  try {
+    if (navigator.storage && navigator.storage.persisted) { const ok = await navigator.storage.persisted(); L.push(ok ? 'Protection contre l\'effacement automatique : <b>activée</b>' : 'Protection contre l\'effacement automatique : <b style="color:#C0392B">non accordée</b> (le téléphone peut effacer les données)'); }
+    if (navigator.storage && navigator.storage.estimate) { const e = await navigator.storage.estimate(); L.push(`Espace utilisé : <b>${((e.usage || 0) / 1048576).toFixed(1)} Mo</b> sur ${((e.quota || 0) / 1048576).toFixed(0)} Mo`); }
+  } catch (e) {}
+  L.push(cloud.user ? `Cloud : <b>connecté</b> (${esc(cloud.user.email)})${cloud.errs ? ` — <b style="color:#C0392B">${cloud.errs} erreur(s), dernière : ${esc(cloud.lastErr)}</b>` : ' — aucune erreur'}` : 'Cloud : <b style="color:#C0392B">non connecté</b> — vos données ne sont pas sauvegardées en ligne');
+  box.innerHTML = L.join('<br>');
+}
 function cloudSyncSectionHTML() {
   if (!cloud.ready) return `<div class="card set-sec"><h2>Synchronisation entre appareils</h2><p class="hint">Service de synchronisation indisponible sur cet appareil pour le moment (pas de connexion, ou navigateur hors ligne). Shopy continue de fonctionner normalement en local.</p></div>`;
   const notifOk = typeof Notification !== 'undefined' && Notification.permission === 'granted';
@@ -720,9 +750,10 @@ function cloudSyncSectionHTML() {
   return `<div class="card set-sec"><h2>Synchronisation entre appareils</h2>
     <p class="hint">Connectez cet appareil avec le compte de la boutique pour synchroniser les données avec votre téléphone/tablette, et recevoir les notifications d'arrivée, de départ et de vente.</p>
     <form data-form="cloudlogin" class="fgrid">
-      <label class="f full"><span>E-mail de la boutique</span><input name="email" type="email" required autocomplete="username"></label>
+      <label class="f full"><span>E-mail de la boutique</span><input name="email" id="cloudEmail" type="email" required autocomplete="username"></label>
       <label class="f full"><span>Mot de passe</span><input name="pass" type="password" required autocomplete="current-password"></label>
       <div class="full"><button class="btn" type="submit">Se connecter</button></div>
+      <div class="full"><button type="button" class="btn ghost sm" data-act="cloudForgot">Mot de passe oublié ?</button></div>
     </form></div>`;
 }
 
@@ -802,8 +833,8 @@ function sideHTML() {
       <button data-act="nav" data-r="settings">Sauvegarder mes données</button></div>` : ''}`;
 }
 function refreshSide() {
-  document.body.classList.toggle('loginmode', needsLogin());
-  if (needsLogin()) { $('#side').innerHTML = ''; $('#topname').textContent = state.settings.shopName || 'Shopy'; $('#topsale').innerHTML = ''; document.title = (state.settings.shopName || 'Shopy') + ' – Connexion'; return; }
+  document.body.classList.toggle('loginmode', gateActive());
+  if (gateActive()) { $('#side').innerHTML = ''; $('#topname').textContent = state.settings.shopName || 'Shopy'; $('#topsale').innerHTML = ''; document.title = (state.settings.shopName || 'Shopy') + ' – Connexion'; return; }
   $('#side').innerHTML = sideHTML();
   $('#topname').textContent = state.settings.shopName || 'Shopy';
   $('#burger').innerHTML = ic('menu', 22);
@@ -811,7 +842,7 @@ function refreshSide() {
   document.title = (state.settings.shopName || 'Shopy') + ' – Gestion de boutique';
 }
 function go(route) {
-  if (needsLogin()) { render(); return; }
+  if (gateActive()) { render(); return; }
   if (!pages[route]) route = 'dashboard';
   if (!canAccessRoute(route)) { toast('Vous n\'avez pas accès à cette page', 'err'); route = 'dashboard'; }
   ui.route = route;
@@ -820,11 +851,16 @@ function go(route) {
 }
 function render() {
   refreshSide();
-  if (needsLogin()) { $('#view').innerHTML = loginGateHTML(); return; }
+  if (isAdminRoute() && ui.session.role === 'admin') { ui.route = 'dashboard'; try { location.hash = '#/dashboard'; } catch (e) {} }
+  if (gateActive()) { $('#view').innerHTML = loginGateHTML(); return; }
   if (!canAccessRoute(ui.route)) { ui.route = 'dashboard'; try { location.hash = '#/dashboard'; } catch (e) {} }
   $$('.nav a').forEach(a => a.classList.toggle('on', a.dataset.r === ui.route));
   const banner = state.persistent ? '' : `<div class="alert out" style="margin-bottom:16px">${ic('alert')}<span>Le stockage de ce navigateur est indisponible : vos données ne seront pas conservées. Ouvrez Shopy dans un navigateur standard.</span></div>`;
-  $('#view').innerHTML = banner + pages[ui.route]();
+  /* Protection : tant que la synchronisation n'est pas active, les données n'existent que sur cet appareil (Android peut les effacer) */
+  const unsynced = (cloud.ready && !cloud.user && state.persistent)
+    ? `<div class="alert out" style="margin-bottom:16px">${ic('alert')}<span><b>Vos données ne sont sauvegardées nulle part ailleurs.</b> Elles sont uniquement dans ce navigateur : si le téléphone les efface, elles sont perdues. Connectez la synchronisation avant d'ajouter vos produits.</span><span style="margin-left:auto;display:flex;gap:16px;flex-wrap:wrap">${canAccessRoute('settings') ? '<button data-act="nav" data-r="settings">Connecter</button>' : ''}${ui.session.role === 'admin' ? '<button data-act="exportData">Sauvegarder</button>' : ''}</span></div>`
+    : (cloud.user && cloud.errs > 0 ? `<div class="alert out" style="margin-bottom:16px">${ic('alert')}<span><b>Problème de synchronisation</b> (${esc(cloud.lastErr)}). Vos dernières modifications ne sont peut-être pas enregistrées sur le cloud.</span></div>` : '');
+  $('#view').innerHTML = banner + unsynced + pages[ui.route]();
   (inits[ui.route] || (() => {}))();
 }
 const refresh = () => { render(); };
@@ -833,6 +869,7 @@ const refresh = () => { render(); };
    PAGES
    ===================================================================== */
 const pages = {}, inits = {};
+inits.settings = () => { checkStorage(); };
 const head = (title, sub, actions = '') => `<div class="head"><div><h1>${title}</h1>${sub ? `<p class="sub">${sub}</p>` : ''}</div><div class="head-actions">${actions}</div></div>`;
 
 /* ---------- Tableau de bord ---------- */
@@ -1836,6 +1873,7 @@ pages.settings = () => {
     `<div class="card set-sec"><h2>Boutique</h2><p class="hint">Ces informations apparaissent dans la barre latérale.</p>
       <div class="fgrid">
         <label class="f"><span>Nom de la boutique</span><input value="${esc(s.shopName)}" data-ch="setField" data-k="shopName"></label>
+        ${ui.session.role === 'admin' ? `<label class="f"><span>Votre nom (affiché à la place de « Administratrice »)</span><input value="${esc(s.adminName || '')}" placeholder="Administratrice" data-ch="setField" data-k="adminName"></label>` : ''}
         <label class="f"><span>Devise</span><input value="DZD (dinar algérien)" disabled></label>
         <label class="f"><span>Seuil d'alerte par défaut</span><input type="number" min="0" step="1" value="${s.defaultAlert}" data-ch="setField" data-k="defaultAlert"></label>
         <label class="f"><span>La semaine commence le</span><select data-ch="setField" data-k="weekStart">${['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'].map((d, i) => `<option value="${i}" ${s.weekStart === i ? 'selected' : ''}>${d}</option>`).join('')}</select></label>
@@ -1851,20 +1889,31 @@ pages.settings = () => {
       </div></div>` : ''}
     ${admin ? permsSectionHTML() : ''}
     ${admin ? cloudSyncSectionHTML() : ''}
+    ${admin ? storageDiagHTML() : ''}
     ${admin ? `<div class="card set-sec"><h2>Sauvegarde de vos données</h2>
       <p class="hint">Vos données sont enregistrées dans ce navigateur, sur cet appareil. Faites une sauvegarde régulièrement : c'est la seule façon de les retrouver si vous changez d'appareil ou videz les données du navigateur.<br>${s.lastBackup ? 'Dernière sauvegarde : ' + new Date(s.lastBackup).toLocaleString('fr-FR', { dateStyle: 'long', timeStyle: 'short' }) : 'Aucune sauvegarde pour le moment.'}</p>
       <div class="head-actions"><button class="btn" data-act="exportData">${ic('download')} Exporter mes données</button>
       <label class="btn ghost" style="cursor:pointer">${ic('upload')} Restaurer une sauvegarde<input type="file" accept=".json,application/json" data-ch="importFile" style="display:none"></label></div></div>` : ''}`;
 };
 const buildBackup = () => JSON.stringify({ app: 'shopy', version: 1, exportedAt: new Date().toISOString(), data: { products: state.products, sales: state.sales, expenses: state.expenses, moves: state.moves, clients: state.clients, materials: state.materials, containers: state.containers, pmoves: state.pmoves, perfumes: state.perfumes, employees: state.employees, shifts: state.shifts, settings: state.settings } });
+function downloadText(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
 async function exportData() {
   const json = buildBackup(), name = `shopy-sauvegarde-${todayKey()}.json`;
-  let dl = null;
-  try { dl = window.claude?.use ? await window.claude.use('downloads') : null; } catch (e) {}
-  if (dl) {
-    try { await dl.save({ filename: name, data: json }); state.settings.lastBackup = new Date().toISOString(); await saveSettings(); toast('Sauvegarde créée'); refresh(); return; }
-    catch (e) { if (e && e.code === 'declined') return; }
-  }
+  try {
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    state.settings.lastBackup = new Date().toISOString(); await saveSettings(); toast('Sauvegarde créée'); refresh(); return;
+  } catch (e) {}
   openModal('Copier la sauvegarde', `<p class="muted" style="margin-bottom:10px">Le téléchargement n'est pas disponible ici. Copiez ce texte et collez-le dans un fichier « ${name} ».</p><textarea class="dl" id="bk" readonly></textarea><div class="m-foot"><button class="btn" data-act="closeModal">Fermer</button></div>`);
   $('#bk').value = json; $('#bk').select();
   state.settings.lastBackup = new Date().toISOString(); saveSettings(); refreshSide();
@@ -1875,6 +1924,8 @@ async function importBackup(file) {
     if (j.app !== 'shopy' || !j.data) throw new Error('bad');
     const ok = await confirmBox('Restaurer cette sauvegarde ?', `Vos données actuelles seront remplacées par celles de la sauvegarde du ${fmtDate(j.exportedAt)} (${(j.data.products || []).length} produits, ${(j.data.sales || []).length} ventes).`, 'Restaurer');
     if (!ok) return;
+    /* Filet de sécurité : les données actuelles sont téléchargées avant d'être remplacées */
+    if (state.products.length || state.sales.length) { try { downloadText(`shopy-avant-restauration-${todayKey()}.json`, buildBackup(), 'application/json'); } catch (e) {} }
     state.products = j.data.products || []; state.sales = j.data.sales || []; state.expenses = j.data.expenses || []; state.moves = j.data.moves || []; state.clients = j.data.clients || [];
     state.materials = j.data.materials || []; state.containers = j.data.containers || []; state.pmoves = j.data.pmoves || []; state.perfumes = j.data.perfumes || [];
     state.employees = j.data.employees || []; state.shifts = j.data.shifts || [];
@@ -2053,10 +2104,15 @@ async function labDownload() {
   const d = labelDoc(items);
   const html = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>Étiquettes</title><style>body{margin:0;font-family:Arial,sans-serif}${LB_CSS}${d.css}
 @media screen{body{background:#eee;padding:16px}.pg{background:#fff;margin:0 auto 16px}.rl{margin:0 auto 12px}.tip{max-width:640px;margin:0 auto 16px;padding:12px 16px;background:#fff;border-radius:8px;font-size:14px}}@media print{.tip{display:none}}</style></head><body><div class="tip"><b>Vos étiquettes sont prêtes.</b> <button onclick="print()">Imprimer</button><br>Dans la fenêtre d'impression, choisissez votre imprimante, le bon format de papier, une échelle de 100 % et désactivez les en-têtes et pieds de page.</div>${d.body}</body></html>`;
-  let dl = null; try { dl = window.claude?.use ? await window.claude.use('downloads') : null; } catch (e) {}
-  if (!dl) return toast('Le téléchargement n\'est pas disponible ici', 'err');
-  try { await dl.save({ filename: `etiquettes-shopy-${todayKey()}.html`, data: html }); toast('Fichier enregistré : ouvrez-le pour imprimer'); }
-  catch (e) { if (!e || e.code !== 'declined') toast('Téléchargement impossible', 'err'); }
+  try {
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `etiquettes-shopy-${todayKey()}.html`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    toast('Fichier enregistré : ouvrez-le pour imprimer');
+  } catch (e) { toast('Téléchargement impossible', 'err'); }
 }
 
 /* =====================================================================
@@ -2219,6 +2275,14 @@ const actions = {
     render();
   },
   cloudLogout() { cloudSignOut(); },
+  checkStorage() { checkStorage(); },
+  async cloudForgot() {
+    const i = $('#cloudEmail'); const email = (i && i.value || '').trim();
+    if (!email) { toast('Écrivez d\'abord votre e-mail dans le champ ci-dessus', 'err'); return; }
+    const r = await cloudResetPassword(email);
+    if (!r.ok) return toast(r.err, 'err');
+    toast('E-mail envoyé : ouvrez votre boîte mail pour choisir un nouveau mot de passe');
+  },
   async askNotif() {
     if (typeof Notification === 'undefined') return toast('Notifications non disponibles sur ce navigateur', 'err');
     try { const p = await Notification.requestPermission(); render(); if (p !== 'granted') toast('Notifications refusées dans les réglages du navigateur', 'err'); }
@@ -2304,6 +2368,7 @@ const changes = {
     if (k === 'defaultAlert') v = Math.max(0, Math.round(num(v)));
     if (k === 'weekStart') v = +v;
     if (k === 'shopName') v = v.trim() || 'Shopy';
+    if (k === 'adminName') v = v.trim();
     state.settings[k] = v; await saveSettings(); refreshSide(); toast('Enregistré');
   },
   async pickLogo(t) {
@@ -2359,8 +2424,16 @@ const forms = {
   },
   gatepass(f) {
     const pw = f.pw.value || '';
-    if (pw !== state.settings.adminPin) { toast('Mot de passe incorrect', 'err'); return; }
+    if (!state.settings.adminPin || pw !== state.settings.adminPin) { toast('Mot de passe incorrect', 'err'); return; }
     ui.session = { role: 'admin', employeeId: null }; saveSession(); refresh();
+  },
+  async adminsetup(f) {
+    if (state.settings.adminPin) return;
+    const a = f.pw.value || '', b = f.pw2.value || '';
+    if (a.length < 6) return toast('6 caractères minimum', 'err');
+    if (a !== b) return toast('Les deux mots de passe sont différents', 'err');
+    state.settings.adminPin = a; await saveSettings();
+    ui.session = { role: 'admin', employeeId: null }; saveSession(); toast('Mot de passe créé'); refresh();
   },
   async cloudlogin(f) {
     const email = f.email.value.trim(), pass = f.pass.value;
@@ -2387,7 +2460,7 @@ const forms = {
     let sc = false;
     [['category', 'categories'], ['brand', 'brands'], ['supplier', 'suppliers']].forEach(([k, l]) => { if (o[k] && !state.settings[l].includes(o[k])) { state.settings[l].push(o[k]); state.settings[l].sort((a, b) => a.localeCompare(b, 'fr')); sc = true; } });
     if (sc) ops.push({ store: 'settings', put: state.settings });
-    closeModal(); await persist(ops); toast(ui.editId ? 'Produit modifié' : 'Produit ajouté'); refresh();
+    closeModal(); await persist(ops); askPersist(); toast((ui.editId ? 'Produit modifié' : 'Produit ajouté') + (cloud.ready && !cloud.user ? ' (sur cet appareil seulement)' : '')); refresh();
   },
   async receive(f) {
     const p = state.products.find(x => x.id === ui.editId); if (!p) return;
@@ -2498,13 +2571,14 @@ document.addEventListener('keydown', e => {
   const t = e.target.closest && e.target.closest('[data-key]'); if (t && keys[t.dataset.key]) keys[t.dataset.key](t, e);
 });
 document.addEventListener('submit', e => { const f = e.target.closest('[data-form]'); if (!f) return; e.preventDefault(); forms[f.dataset.form] && forms[f.dataset.form](f); });
-window.addEventListener('hashchange', () => { const r = location.hash.replace('#/', ''); if (pages[r] && r !== ui.route) { ui.route = r; render(); } });
+window.addEventListener('hashchange', () => { const r = location.hash.replace('#/', ''); if (r === 'admin') { render(); return; } if (pages[r] && r !== ui.route) { ui.route = r; render(); } });
 window.addEventListener('storage', e => { if (e.key === 'shopy-session') { ui.session = loadSession(); render(); } });
 
 let lastW = window.innerWidth, rzT;
 window.addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(() => { if (window.innerWidth !== lastW) { lastW = window.innerWidth; if (ui.route === 'stats') renderStatsBody(); } }, 150); });
 
 /* ---------- Démarrage ---------- */
+async function askPersist() { try { if (navigator.storage && navigator.storage.persist) state.persisted = await navigator.storage.persist(); } catch (e) {} }
 (async function boot() {
   try {
     await DB.open();
@@ -2515,7 +2589,7 @@ window.addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(()
     const st = (await DB.getAll('settings')).find(x => x.key === 'main');
     state.settings = { ...clone(DEFAULT_SETTINGS), ...(st || {}) };
     if (!st) await persist([{ store: 'settings', put: state.settings }]);
-    try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
+    askPersist();
   } catch (e) { console.error(e); state.persistent = false; state.settings = clone(DEFAULT_SETTINGS); }
   ui.session = state.settings.adminPin ? loadSession() : { role: 'admin', employeeId: null };
   if (ui.session.role === 'employee' && !state.employees.some(e => e.id === ui.session.employeeId)) ui.session = { role: null, employeeId: null };
