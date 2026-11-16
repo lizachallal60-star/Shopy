@@ -459,6 +459,7 @@ const DEFAULT_SETTINGS = {
   key: 'main', shopName: 'Shopy', adminName: '', logo: '', currency: 'DZD', defaultAlert: 5, weekStart: 0,
   categories: ['Maquillage', 'Soin visage', 'Soin corps', 'Cheveux', 'Parfums', 'Ongles', 'Accessoires'],
   brands: [], suppliers: [], lastBackup: null, barcodeSeq: 0,
+  cash: { base: 0, since: '', log: [] },
   label: { fmt: 'a4-24', w: 50, h: 30, showName: true, showPrice: true },
   materialCats: ['Notes parfumées', 'Huiles essentielles', 'Éthanol', 'Eau distillée', 'PEG-40', 'Fixateur', 'Conservateur', 'Vitamine B5', 'Colorants', 'Autres ingrédients'],
   containerFormats: ['Flacon 40 ml', 'Flacon 100 ml', 'Flacon 200 ml', 'Vaporisateur', 'Bouchon', 'Autre'],
@@ -649,19 +650,21 @@ const ui = {
 };
 /* ---------- Autorisations des employés ---------- */
 const PERM_DEFS = [
-  ['sales', 'Ventes'], ['products', 'Produits'], ['stock', 'Stock'], ['horaires', 'Horaires'],
+  ['sales', 'Ventes'], ['products', 'Voir les produits et les prix'], ['productsEdit', 'Ajouter / modifier / supprimer des produits'], ['stock', 'Stock'], ['horaires', 'Horaires'],
   ['clients', 'Clients'], ['suppliers', 'Fournisseurs'], ['perfumes', 'Parfums sur mesure'], ['expenses', 'Dépenses'],
   ['stats', 'Statistiques'], ['revenue', "Chiffre d'affaires"], ['margins', 'Marges'], ['profit', 'Bénéfices'],
   ['settings', 'Paramètres'], ['employees', 'Gestion des employés']
 ];
-/* Par défaut : outils du quotidien ouverts, chiffres sensibles et administration fermés tant que rien n'est configuré */
-const DEFAULT_PERM = { sales: true, products: true, stock: true, horaires: true, clients: true, suppliers: true, perfumes: true, expenses: true, stats: false, revenue: false, margins: false, profit: false, settings: false, employees: false };
+/* Par défaut, une employée peut seulement : vendre, voir les produits et leurs prix, pointer ses horaires. Tout le reste doit être autorisé par l'administratrice */
+const DEFAULT_PERM = { sales: true, products: true, productsEdit: false, stock: false, horaires: true, clients: false, suppliers: false, perfumes: false, expenses: false, stats: false, revenue: false, margins: false, profit: false, settings: false, employees: false };
 const ROUTE_PERM = { products: 'products', sales: 'sales', history: 'sales', stock: 'stock', clients: 'clients', perfumes: 'perfumes', horaires: 'horaires', expenses: 'expenses', stats: 'stats', settings: 'settings' };
 const currentEmp = () => state.employees.find(e => e.id === ui.session.employeeId);
 const hasPerm = (emp, key) => !emp ? false : (emp.perms && key in emp.perms ? !!emp.perms[key] : DEFAULT_PERM[key] !== false);
 /* Vérification réelle : l'administratrice a toujours tout, sinon on regarde les autorisations de l'employée connectée */
 const can = key => ui.session.role === 'admin' ? true : hasPerm(currentEmp(), key);
-const canAccessRoute = route => ui.session.role === 'admin' ? true : (ROUTE_PERM[route] ? can(ROUTE_PERM[route]) : true);
+const ADMIN_ONLY_ROUTES = ['caisse'];
+const canAccessRoute = route => ui.session.role === 'admin' ? true : ADMIN_ONLY_ROUTES.includes(route) ? false : (ROUTE_PERM[route] ? can(ROUTE_PERM[route]) : true);
+const denied = key => { if (can(key)) return false; toast('Vous n\'avez pas l\'autorisation de faire cela', 'err'); return true; };
 const needsLogin = () => !!state.settings.adminPin && !ui.session.role;
 /* Interface administratrice : adresse .../#/admin, protégée par mot de passe, séparée de l'accès des employées */
 const isAdminRoute = () => { try { return /^#\/admin\/?$/.test(location.hash); } catch (e) { return false; } };
@@ -817,7 +820,7 @@ const NAV = [
   ['dashboard', 'Tableau de bord', 'home'], ['products', 'Produits', 'bag'], ['sales', 'Ventes', 'receipt'],
   ['history', 'Historique des ventes', 'clock'], ['stock', 'Stock', 'box'],
   ['clients', 'Clients', 'users'], ['perfumes', 'Parfums sur mesure', 'drop'], ['horaires', 'Horaires', 'clock'],
-  ['expenses', 'Dépenses', 'wallet'], ['stats', 'Statistiques', 'chart'], ['settings', 'Paramètres', 'sliders']
+  ['expenses', 'Dépenses', 'wallet'], ['caisse', 'Caisse', 'wallet'], ['stats', 'Statistiques', 'chart'], ['settings', 'Paramètres', 'sliders']
 ];
 function sideHTML() {
   const s = state.settings;
@@ -909,8 +912,8 @@ pages.dashboard = () => {
   if (!state.products.length && !state.sales.length) {
     return head('Bienvenue', 'Votre boutique est prête. Commencez par ajouter vos premiers produits.') +
       `<div class="card empty"><h3>Aucun produit pour l'instant</h3><p>Ajoutez vos produits, puis enregistrez votre première vente en quelques secondes.</p>
-      <div class="head-actions" style="justify-content:center"><button class="btn" data-act="addProduct">${ic('plus')} Ajouter un produit</button>
-      <button class="btn ghost" data-act="nav" data-r="settings">Restaurer une sauvegarde</button></div></div>`;
+      <div class="head-actions" style="justify-content:center">${can('productsEdit') ? `<button class="btn" data-act="addProduct">${ic('plus')} Ajouter un produit</button>` : ''}
+      ${can('settings') ? `<button class="btn ghost" data-act="nav" data-r="settings">Restaurer une sauvegarde</button>` : ''}</div></div>`;
   }
   let al = '';
   if (out) al += `<div class="alert out">${ic('alert')}<span>${out} ${plural(out, 'produit est', 'produits sont')} en rupture de stock.</span><button data-act="nav" data-r="stock">Voir le stock</button></div>`;
@@ -975,19 +978,19 @@ function prodRow(p) {
     <div class="pcol hide-m"><span>${money(p.sell)}</span><small>${can('margins') ? 'Achat ' + money(p.buy) : ''}</small></div>
     <div class="pcol hide-m">${can('margins') ? `<span>${money(m)}</span><small>${pct} % du prix</small>` : '<span>—</span>'}</div>
     <div class="pstock">${badge(p)}</div>
-    <div class="pact"><button class="icon-btn" data-act="labelOne" data-id="${p.id}" aria-label="Étiquette de ${esc(p.name)}">${ic('barcode')}</button><button class="icon-btn" data-act="editProduct" data-id="${p.id}" aria-label="Modifier ${esc(p.name)}">${ic('edit')}</button>
-      <button class="icon-btn" data-act="delProduct" data-id="${p.id}" aria-label="Supprimer ${esc(p.name)}">${ic('trash')}</button></div></div>`;
+    <div class="pact">${can('productsEdit') ? `<button class="icon-btn" data-act="labelOne" data-id="${p.id}" aria-label="Étiquette de ${esc(p.name)}">${ic('barcode')}</button><button class="icon-btn" data-act="editProduct" data-id="${p.id}" aria-label="Modifier ${esc(p.name)}">${ic('edit')}</button>
+      <button class="icon-btn" data-act="delProduct" data-id="${p.id}" aria-label="Supprimer ${esc(p.name)}">${ic('trash')}</button>` : ''}</div></div>`;
 }
 pages.products = () => {
   const f = ui.prod;
   const opt = (arr, v, all) => `<option value="">${all}</option>` + arr.map(x => `<option ${x === v ? 'selected' : ''} value="${esc(x)}">${esc(x)}</option>`).join('');
   const nLow = state.products.filter(p => p.qty > 0 && p.qty <= p.alert).length, nOut = state.products.filter(p => p.qty <= 0).length;
-  return head('Produits', `${state.products.length} ${plural(state.products.length, 'produit', 'produits')} dans votre catalogue`, `<button class="btn ghost" data-act="openLabels">${ic('barcode')} Étiquettes</button><button class="btn" data-act="addProduct">${ic('plus')} Ajouter un produit</button>`) +
+  return head('Produits', `${state.products.length} ${plural(state.products.length, 'produit', 'produits')} dans votre catalogue`, can('productsEdit') ? `<button class="btn ghost" data-act="openLabels">${ic('barcode')} Étiquettes</button><button class="btn" data-act="addProduct">${ic('plus')} Ajouter un produit</button>` : '') +
     `<div class="card"><div class="toolbar">
       <div class="search">${ic('search')}<input type="search" placeholder="Rechercher un produit, une marque, un code" value="${esc(f.q)}" data-in="pSearch" aria-label="Rechercher"></div>
       <select data-ch="pCat" aria-label="Catégorie">${opt(uniqueVals('category', 'categories'), f.cat, 'Toutes les catégories')}</select>
       <select data-ch="pBrand" aria-label="Marque">${opt(uniqueVals('brand', 'brands'), f.brand, 'Toutes les marques')}</select>
-      <select data-ch="pSort" aria-label="Trier par">${[['name', 'Nom (A à Z)'], ['priceAsc', 'Prix croissant'], ['priceDesc', 'Prix décroissant'], ['stockAsc', 'Stock croissant'], ['stockDesc', 'Stock décroissant'], ['margin', 'Meilleure marge']].map(([v, l]) => `<option value="${v}" ${f.sort === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      <select data-ch="pSort" aria-label="Trier par">${[['name', 'Nom (A à Z)'], ['priceAsc', 'Prix croissant'], ['priceDesc', 'Prix décroissant'], ['stockAsc', 'Stock croissant'], ['stockDesc', 'Stock décroissant'], ...(can('margins') ? [['margin', 'Meilleure marge']] : [])].map(([v, l]) => `<option value="${v}" ${f.sort === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
       <div class="chips" style="margin-bottom:14px">${[['all', 'Tous'], ['low', 'Bientôt en rupture (' + nLow + ')'], ['out', 'En rupture (' + nOut + ')']].map(([v, l]) => `<button class="chip ${f.flt === v ? 'on' : ''}" data-act="pFlt" data-v="${v}">${l}</button>`).join('')}</div>
       <div class="list-head"><span></span><span>Produit</span><span>Prix de vente</span><span>Marge</span><span>Stock</span><span></span></div>
       <div class="list" id="plist"></div></div>`;
@@ -997,7 +1000,7 @@ function renderProductList() {
   const box = $('#plist'); if (!box) return;
   const a = filteredProducts();
   box.innerHTML = a.length ? a.map(prodRow).join('') :
-    `<div class="empty"><h3>${state.products.length ? 'Aucun résultat' : 'Aucun produit'}</h3><p>${state.products.length ? 'Essayez une autre recherche ou retirez un filtre.' : 'Ajoutez votre premier produit pour commencer.'}</p>${state.products.length ? '' : `<button class="btn" data-act="addProduct">${ic('plus')} Ajouter un produit</button>`}</div>`;
+    `<div class="empty"><h3>${state.products.length ? 'Aucun résultat' : 'Aucun produit'}</h3><p>${state.products.length ? 'Essayez une autre recherche ou retirez un filtre.' : 'Ajoutez votre premier produit pour commencer.'}</p>${state.products.length || !can('productsEdit') ? '' : `<button class="btn" data-act="addProduct">${ic('plus')} Ajouter un produit</button>`}</div>`;
 }
 function productForm(id) {
   const p = id ? state.products.find(x => x.id === id) : null;
@@ -1104,7 +1107,7 @@ async function saveSale() {
   for (const l of c.lines) { const p = state.products.find(x => x.id === l.pid); if (!p || p.qty < l.qty) return toast(`Stock insuffisant pour ${l.name}`, 'err'); }
   const t = cartTotals(), dtEl = $('#sdt'), cl = state.clients.find(x => x.id === c.clientId);
   const when = dtEl && dtEl.value && dtEl.value !== dtEl.dataset.init ? new Date(dtEl.value) : new Date();
-  const sale = { id: uid(), date: when.toISOString(), lines: c.lines.map(l => ({ ...l })), subtotal: t.sub, discount: t.d, total: t.total, cost: t.cost, clientId: cl ? cl.id : '', client: cl ? clientName(cl) : '' };
+  const sale = { id: uid(), at: new Date().toISOString(), date: when.toISOString(), lines: c.lines.map(l => ({ ...l })), subtotal: t.sub, discount: t.d, total: t.total, cost: t.cost, clientId: cl ? cl.id : '', client: cl ? clientName(cl) : '' };
   const ops = [{ store: 'sales', put: sale }];
   c.lines.forEach(l => { const p = state.products.find(x => x.id === l.pid); p.qty -= l.qty; ops.push({ store: 'products', put: p }); ops.push({ store: 'moves', put: mkMove(p, -l.qty, 'sale', sale.id) }); });
   state.sales.push(sale);
@@ -1113,6 +1116,52 @@ async function saveSale() {
   toast(`Vente enregistrée : ${money(sale.total)}`);
   refreshSide(); render();
 }
+
+
+/* ---------- Caisse : réservée à l'administratrice. Calcul au centime : on compte en centimes entiers ---------- */
+const toC = n => Math.round((+n || 0) * 100);
+const idTime = id => { const m = String(id || ''); if (m.length < 9) return 0; const t = parseInt(m.slice(0, -5), 36); return t > 1577836800000 && t < 4102444800000 ? t : 0; };
+const createdAt = x => (x.at ? new Date(x.at).getTime() : 0) || idTime(x.id) || new Date(x.date).getTime() || 0;
+function cashSummary() {
+  const c = state.settings.cash || {};
+  if (!c.since) return { configured: false };
+  const since = new Date(c.since).getTime();
+  let inC = 0, outC = 0, nIn = 0, nOut = 0;
+  state.sales.forEach(x => { if (createdAt(x) > since) { inC += toC(x.total); nIn++; } });
+  state.expenses.forEach(x => { if (createdAt(x) > since) { outC += toC(x.amount); nOut++; } });
+  const baseC = toC(c.base);
+  return { configured: true, since: c.since, baseC, inC, outC, nIn, nOut, curC: baseC + inC - outC };
+}
+async function cashRebase(amount, note) {
+  const before = cashSummary(), nowIso = new Date().toISOString(), after = toC(amount) / 100;
+  const entry = { at: nowIso, kind: before.configured ? 'ajustement' : 'départ', before: before.configured ? before.curC / 100 : null, after, diff: before.configured ? (toC(amount) - before.curC) / 100 : null, note: (note || '').trim() };
+  const c = state.settings.cash || { base: 0, since: '', log: [] };
+  state.settings.cash = { base: after, since: nowIso, log: [entry, ...(c.log || [])].slice(0, 200) };
+  await saveSettings();
+}
+function cashCardHTML() {
+  const s = cashSummary();
+  return `<div class="card kpi" style="margin-top:16px"><div class="lab">Caisse actuelle</div>${s.configured ? `<div class="val ${s.curC < 0 ? 'neg' : ''}">${moneyNum(s.curC / 100)}<span>DZD</span></div>` : '<div class="muted" style="margin:6px 0">Pas encore réglée : indiquez ce qu\'il y a dans la caisse.</div>'}
+    <button class="btn ghost sm" data-act="nav" data-r="caisse" style="margin-top:8px">${s.configured ? 'Voir la caisse' : 'Régler la caisse'}</button></div>`;
+}
+{ const _dash = pages.dashboard; pages.dashboard = () => _dash() + (ui.session.role === 'admin' ? cashCardHTML() : ''); }
+pages.caisse = () => {
+  if (ui.session.role !== 'admin') return head('Caisse', '') + '<div class="card empty"><p>Cette page est réservée à l\'administratrice.</p></div>';
+  const s = cashSummary(), log = (state.settings.cash && state.settings.cash.log) || [];
+  if (!s.configured) return head('Caisse', 'Pour que Shopy suive votre caisse au centime') +
+    `<div class="card"><h2 class="sec">Combien y a-t-il dans la caisse en ce moment ?</h2>
+      <p class="hint">Comptez les billets et les pièces, puis écrivez le total ci-dessous. À partir de cet instant, Shopy calcule tout seul : <b>caisse = ce montant + ventes − dépenses</b> enregistrées ensuite. Seule l'administratrice peut voir et modifier ceci.</p>
+      <form data-form="cashset" class="fgrid" autocomplete="off" style="margin-top:12px"><label class="f"><span>Montant dans la caisse (DZD)</span><input name="amount" type="number" min="0" step="0.01" inputmode="decimal" required></label>
+      <div class="full"><button class="btn" type="submit">Enregistrer ce montant de départ</button></div></form></div>`;
+  return head('Caisse', 'Calculée automatiquement au centime', `<button class="btn" data-act="cashAdjust">Recompter / corriger la caisse</button>`) +
+    `<div class="grid g2" style="margin-bottom:16px"><div class="card kpi"><div class="lab">Caisse actuelle</div><div class="val ${s.curC < 0 ? 'neg' : ''}">${moneyNum(s.curC / 100)}<span>DZD</span></div></div>
+      <section class="card result"><h2 class="sec">Détail depuis le ${fmtDT(s.since)}</h2>
+        <div class="trow"><span>Montant de départ</span><b style="font-weight:600">${money(s.baseC / 100)}</b></div>
+        <div class="trow"><span>+ Ventes (${s.nIn})</span><b style="font-weight:600">${money(s.inC / 100)}</b></div>
+        <div class="trow"><span>− Dépenses (${s.nOut})</span><b style="font-weight:600">${money(s.outC / 100)}</b></div>
+        <div class="trow final"><span style="color:var(--text);font-weight:600">Caisse</span><b class="${s.curC < 0 ? 'neg' : ''}">${money(s.curC / 100)}</b></div></section></div>
+    <section class="card"><h2 class="sec">Historique des réglages</h2>${log.length ? log.map(e => `<div class="wa"><div class="grow"><b>${e.kind === 'départ' ? 'Montant de départ' : 'Caisse recomptée'} : ${money(e.after)}</b><small>${fmtDT(e.at)}${e.kind === 'ajustement' ? ` — Shopy calculait ${money(e.before)}, écart ${e.diff > 0 ? '+' : ''}${money(e.diff)}` : ''}${e.note ? ' — ' + esc(e.note) : ''}</small></div></div>`).join('') : '<div class="empty-sm">Aucun réglage.</div>'}</section>`;
+};
 
 /* ---------- Clients ---------- */
 const RECENT_DAYS = 30;
@@ -2126,9 +2175,10 @@ const actions = {
   confirmYes() { const r = confirmResolve; confirmResolve = null; closeModal(); r && r(true); },
   confirmNo() { closeModal(); },
   range(t) { ui.chartRange = +t.dataset.n; render(); },
-  addProduct() { productForm(); },
-  editProduct(t) { productForm(t.dataset.id); },
+  addProduct() { if (denied('productsEdit')) return; productForm(); },
+  editProduct(t) { if (denied('productsEdit')) return; productForm(t.dataset.id); },
   async delProduct(t) {
+    if (denied('productsEdit')) return;
     const p = state.products.find(x => x.id === t.dataset.id); if (!p) return;
     if (!await confirmBox('Supprimer ce produit ?', `« ${esc(p.name)} » sera retiré du catalogue. Les ventes déjà enregistrées sont conservées.`, 'Supprimer', true)) return;
     state.products = state.products.filter(x => x.id !== p.id);
@@ -2176,8 +2226,8 @@ const actions = {
   async listDel(t) { const k = t.dataset.k; state.settings[k] = state.settings[k].filter(x => x !== t.dataset.v); await saveSettings(); render(); },
   noLogo() { state.settings.logo = ''; saveSettings(); refresh(); },
   exportData,
-  openLabels() { openLabels(); },
-  labelOne(t) { openLabels(t.dataset.id); },
+  openLabels() { if (denied('productsEdit')) return; openLabels(); },
+  labelOne(t) { if (denied('productsEdit')) return; openLabels(t.dataset.id); },
   labAll() { state.products.forEach(p => ui.lab.qty[p.id] = 1); renderLabList(); labRefresh(); },
   labNone() { ui.lab.qty = {}; renderLabList(); labRefresh(); },
   labPrint, labDownload,
@@ -2275,6 +2325,14 @@ const actions = {
     render();
   },
   cloudLogout() { cloudSignOut(); },
+  cashAdjust() {
+    if (ui.session.role !== 'admin') return;
+    const s = cashSummary();
+    openModal('Recompter la caisse', `<form data-form="cashadjust" class="fgrid" autocomplete="off"><p class="muted full">Shopy calcule actuellement <b>${money((s.curC || 0) / 100)}</b>. Comptez ce qu'il y a vraiment et écrivez-le : Shopy repart de ce montant (l'écart est gardé dans l'historique).</p>
+      <label class="f full"><span>Montant réellement dans la caisse (DZD)</span><input name="amount" type="number" min="0" step="0.01" inputmode="decimal" required></label>
+      <label class="f full"><span>Note (facultatif)</span><input name="note" placeholder="Ex. retrait pour achat de marchandises"></label>
+      <div class="m-foot full"><button type="button" class="btn ghost" data-act="closeModal">Annuler</button><button class="btn" type="submit">Enregistrer</button></div></form>`);
+  },
   checkStorage() { checkStorage(); },
   async cloudForgot() {
     const i = $('#cloudEmail'); const email = (i && i.value || '').trim();
@@ -2427,6 +2485,16 @@ const forms = {
     if (!state.settings.adminPin || pw !== state.settings.adminPin) { toast('Mot de passe incorrect', 'err'); return; }
     ui.session = { role: 'admin', employeeId: null }; saveSession(); refresh();
   },
+  async cashset(f) {
+    if (ui.session.role !== 'admin') return;
+    const a = num(f.amount.value); if (a < 0 || f.amount.value === '') return toast('Indiquez un montant', 'err');
+    await cashRebase(a, ''); toast('Caisse réglée'); render();
+  },
+  async cashadjust(f) {
+    if (ui.session.role !== 'admin') return;
+    const a = num(f.amount.value); if (a < 0 || f.amount.value === '') return toast('Indiquez un montant', 'err');
+    await cashRebase(a, f.note ? f.note.value : ''); closeModal(); toast('Caisse mise à jour'); render();
+  },
   async adminsetup(f) {
     if (state.settings.adminPin) return;
     const a = f.pw.value || '', b = f.pw2.value || '';
@@ -2444,6 +2512,7 @@ const forms = {
     toast('Connecté·e — synchronisation en cours'); render();
   },
   async product(f) {
+    if (denied('productsEdit')) return;
     const d = Object.fromEntries(new FormData(f)), name = (d.name || '').trim();
     if (!name) return toast('Ajoutez un nom de produit', 'err');
     const o = { name, category: d.category.trim(), brand: d.brand.trim(), sku: d.sku.trim(), barcode: d.barcode.trim(), buy: num(d.buy), sell: num(d.sell), qty: Math.max(0, Math.round(num(d.qty))), alert: Math.max(0, Math.round(num(d.alert))), supplier: d.supplier.trim(), added: d.added || todayKey(), photo: ui.photoTmp || '' };
@@ -2480,7 +2549,7 @@ const forms = {
     if (!(amount > 0)) return toast('Indiquez un montant', 'err');
     let e;
     if (ui.editId) { e = state.expenses.find(x => x.id === ui.editId); Object.assign(e, { category: d.category, description: d.description.trim(), amount, date: d.date }); }
-    else { e = { id: uid(), category: d.category, description: d.description.trim(), amount, date: d.date }; state.expenses.push(e); }
+    else { e = { id: uid(), at: new Date().toISOString(), category: d.category, description: d.description.trim(), amount, date: d.date }; state.expenses.push(e); }
     closeModal(); await persist([{ store: 'expenses', put: e }]); toast('Dépense enregistrée'); render();
   },
   async client(f) {
